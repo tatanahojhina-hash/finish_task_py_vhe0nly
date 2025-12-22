@@ -11,8 +11,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 tasks = load_tasks()
 next_id = max([t.id for t in tasks] + [0]) + 1
 
-class TodoHandler:
-    pass
 
 
 
@@ -118,12 +116,12 @@ class TodoHandler(BaseHTTPRequestHandler):
                 self.end_headers()
 
 
-    if __name__ == '__main__':
-        server_address = ('', 8000)
-        httpd = HTTPServer(server_address, TodoHandler)
-        logging.info('Server running on port 8000...')
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            logging.info('Server stopped.')
-            httpd.shutdown()
+if __name__ == '__main__':
+    server_address = ('', 8000)
+    httpd = HTTPServer(server_address, TodoHandler)
+    logging.info('Server running on port 8000...')
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        logging.info('Server stopped.')
+        httpd.shutdown()
