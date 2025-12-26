@@ -1,127 +1,280 @@
-import json
-import logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import os
+import re
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import Any, Optional
 from urllib.parse import urlparse, parse_qs
 
-from models import Task
-from storage import load_tasks, save_tasks
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-tasks = load_tasks()
-next_id = max([t.id for t in tasks] + [0]) + 1
+TASKS_FILENAME = 'tasks.txt'
+ALLOWED_PRIORITIES = {"low", "normal", "high"}
 
 
+def log(message: str) -> None:
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {message}", flush=True)
 
 
-class TodoHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
+@dataclass
+class Task:
 
-        if self.path.startswith('/tasks'):
-            parsed_path = urlparse(self.path)
-            query = parse_qs(parsed_path.query)
-            priority_filter = query.get('priority', [None])[0]  # Фильтр по priority (улучшение)
+    title: str
+    priority: str
+    isDone: bool
+    id: int
 
-            filtered_tasks = tasks
-            if priority_filter:
-                filtered_tasks = [t for t in tasks if t.priority == priority_filter]
+class TaskStorage:
 
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps([task.to_dict() for task in filtered_tasks]).encode('utf-8'))
-            logging.info(f"GET /tasks - returned {len(filtered_tasks)} tasks")
-        else:
-            self.send_response(404)
-            self.end_headers()
+    def __init__(self, filename: str):
 
-    def do_POST(self):
+        self._filename = filename
+        self._tasks_by_id: dict[int, Task] = {}
+        self._next_task_id = 1
+        self._load_from_file()
 
-        global tasks, next_id
-        if self.path == '/tasks':
+    def list_tasks(self, *, is_done: Optional[bool] = None, priority: Optional[str] = None) -> list[Task]:
 
-            content_length = int(self.headers.get('Content-Length', 0))
-            post_data = self.rfile.read(content_length)
-            try:
-                data = json.loads(post_data.decode('utf-8'))
-                if 'title' not in data or 'priority' not in data or not data['title'].strip():
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(b'{"error": "Missing or invalid title/priority"}')
-                    return
-                if data['priority'] not in ['low', 'normal', 'high']:
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(b'{"error": "Priority must be low, normal, or high"}')
-                    return
-                task = Task(data['title'], data['priority'], task_id=next_id)
-                next_id += 1
-                tasks.append(task)
-                save_tasks(tasks)
-                self.send_response(201)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps(task.to_dict()).encode('utf-8'))
-                logging.info(f"POST /tasks - created task {task.id}")
-            except json.JSONDecodeError:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b'{"error": "Invalid JSON"}')
-        elif self.path.startswith('/tasks/') and self.path.endswith('/complete'):
-            # Отметка задачи как выполненной
-            try:
-                task_id = int(self.path.split('/')[2])
-                for task in tasks:
-                    if task.id == task_id:
-                        task.is_done = True
-                        save_tasks(tasks)
-                        self.send_response(200)
-                        self.end_headers()
-                        logging.info(f"POST /tasks/{task_id}/complete - marked as done")
-                        return
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write(b'{"error": "Task not found"}')
-            except ValueError:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b'{"error": "Invalid task ID"}')
-        else:
-            self.send_response(404)
-            self.end_headers()
+        tasks = list(self._tasks_by_id.values())
+        tasks.sort(key=lambda t: t.id)
 
-        def do_DELETE(self):
-            # Обработка DELETE-запросов: удаление задачи (дополнительное улучшение)
-            global tasks
-            if self.path.startswith('/tasks/'):
-                try:
-                    task_id = int(self.path.split('/')[2])
-                    for i, task in enumerate(tasks):
-                        if task.id == task_id:
-                            del tasks[i]
-                            save_tasks(tasks)
-                            self.send_response(200)
-                            self.end_headers()
-                            logging.info(f"DELETE /tasks/{task_id} - deleted")
-                            return
-                    self.send_response(404)
-                    self.end_headers()
-                    self.wfile.write(b'{"error": "Task not found"}')
-                except ValueError:
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(b'{"error": "Invalid task ID"}')
+        if is_done is not None:
+            tasks = [t for t in tasks if t.isDone == is_done]
+
+        if priority is not None:
+            tasks = [t for t in tasks if t.priority == priority]
+
+        return tasks
+
+    def create_task(self, title: str, priority: str) -> Task:
+
+        task = Task(title=title, priority=priority, isDone=False, id=self._next_task_id)
+        self._tasks_by_id[task.id] = task
+        self._next_task_id += 1
+        self._save_to_file_atomic()
+        return task
+
+    def mark_task_completed(self, task_id: int) -> bool:
+
+        task = self._tasks_by_id.get(task_id)
+        if task is None:
+            return False
+        task.isDone = True
+        self._save_to_file_atomic()
+        return True
+
+    def _load_from_file(self) -> None:
+       
+        if not os.path.exists(self._filename):
+            return
+
+        with open(self._filename, "r", encoding="utf-8") as f:
+            contents = f.read().strip()
+            if not contents:
+                return
+
+        try:
+            parsed = json.loads(contents)
+        except json.JSONDecodeError:
+            return
+
+        if not isinstance(parsed, list):
+            return
+
+        loaded: dict[int, Task] = {}
+        max_id = 0
+
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+
+            title = item.get("title")
+            priority = item.get("priority")
+            is_done = item.get("isDone")
+            task_id = item.get("id")
+
+            if (
+                isinstance(title, str)
+                and isinstance(priority, str)
+                and priority in ALLOWED_PRIORITIES
+                and isinstance(is_done, bool)
+                and isinstance(task_id, int)
+                and task_id > 0
+            ):
+                loaded[task_id] = Task(title=title, priority=priority, isDone=is_done, id=task_id)
+                max_id = max(max_id, task_id)
+
+        self._tasks_by_id = loaded
+        self._next_task_id = max_id + 1
+
+    def _save_to_file_atomic(self) -> None:
+        
+        data = [asdict(t) for t in self.list_tasks()]
+        tmp_name = f"{self._filename}.tmp"
+
+        with open(tmp_name, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+        os.replace(tmp_name, self._filename)
+
+
+storage = TaskStorage(TASKS_FILENAME)
+
+
+class TaskApiHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, format: str, *args) -> None:
+
+        log(f'{self.client_address[0]} "{self.requestline}" {args[1]}')
+
+    def _send_json(self, status_code: int, payload: Any, extra_headers: Optional[dict[str, str]] = None) -> None:
+
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_empty(self, status_code: int, extra_headers: Optional[dict[str, str]] = None) -> None:
+
+        self.send_response(status_code)
+        self.send_header("Content-Length", "0")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+
+    def _read_request_json(self) -> Optional[Any]:
+
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(content_length) if content_length > 0 else b""
+        if not body:
+            return None
+        try:
+            return json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+    def _require_json_content_type(self) -> bool:
+
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        return content_type == "application/json"
+
+    def _parse_non_negative_int(self, query: dict[str, list[str]], name: str) -> Optional[int]:
+
+        if name not in query or not query[name]:
+            return None
+        value_str = query[name][0].strip()
+        if not value_str.isdigit():
+            return -1
+        return int(value_str)
+
+    def do_GET(self) -> None:
+
+        parsed_url = urlparse(self.path)
+
+        if parsed_url.path != "/tasks":
+            self._send_empty(404)
+            return
+
+        query = parse_qs(parsed_url.query)
+
+        is_done: Optional[bool] = None
+        if "isDone" in query and query["isDone"]:
+            value = query["isDone"][0].strip().lower()
+            if value in {"true", "false"}:
+                is_done = (value == "true")
             else:
-                self.send_response(404)
-                self.end_headers()
+                self._send_json(400, {"error": "Query 'isDone' must be 'true' or 'false'"})
+                return
+
+        priority: Optional[str] = None
+        if "priority" in query and query["priority"]:
+            value = query["priority"][0].strip()
+            if value in ALLOWED_PRIORITIES:
+                priority = value
+            else:
+                self._send_json(400, {"error": "Query 'priority' must be one of: low, normal, high"})
+                return
+
+        limit = self._parse_non_negative_int(query, "limit")
+        offset = self._parse_non_negative_int(query, "offset")
+
+        if limit == -1:
+            self._send_json(400, {"error": "Query 'limit' must be a non-negative integer"})
+            return
+        if offset == -1:
+            self._send_json(400, {"error": "Query 'offset' must be a non-negative integer"})
+            return
+
+        tasks = storage.list_tasks(is_done=is_done, priority=priority)
+
+        start = offset or 0
+        if start > len(tasks):
+            tasks_page = []
+        else:
+            tasks_page = tasks[start:]
+
+        if limit is not None:
+            tasks_page = tasks_page[:limit]
+
+        tasks_json = [asdict(t) for t in tasks_page]
+        self._send_json(200, tasks_json)
+
+    def do_POST(self) -> None:
+
+        parsed_url = urlparse(self.path)
+
+        if parsed_url.path == "/tasks":
+            if not self._require_json_content_type():
+                self._send_json(415, {"error": "Content-Type must be application/json"})
+                return
+
+            request_json = self._read_request_json()
+            if not isinstance(request_json, dict):
+                self._send_json(400, {"error": "Invalid JSON"})
+                return
+
+            title = request_json.get("title")
+            priority = request_json.get("priority")
+
+            if not isinstance(title, str) or not title.strip():
+                self._send_json(400, {"error": "Field 'title' must be a non-empty string"})
+                return
+
+            if not isinstance(priority, str) or priority not in ALLOWED_PRIORITIES:
+                self._send_json(400, {"error": "Field 'priority' must be one of: low, normal, high"})
+                return
+
+            created = storage.create_task(title.strip(), priority)
+            self._send_json(201, asdict(created), extra_headers={"Location": f"/tasks/{created.id}"})
+            return
+
+        complete_match = re.fullmatch(r"/tasks/(\d+)/complete", parsed_url.path)
+        if complete_match:
+            task_id = int(complete_match.group(1))
+            ok = storage.mark_task_completed(task_id)
+            self._send_empty(200 if ok else 404)
+            return
+
+        self._send_empty(404)
 
 
-if __name__ == '__main__':
-    server_address = ('', 8000)
-    httpd = HTTPServer(server_address, TodoHandler)
-    logging.info('Server running on port 8000...')
+def run_server(host: str = "", port: int = 8000) -> None:
+
+    httpd = HTTPServer((host, port), TaskApiHandler)
+    log(f"Server started on http://localhost:{port}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        logging.info('Server stopped.')
-        httpd.shutdown()
+        httpd.server_close()
+
+
+if __name__ == "__main__":
+    run_server()
